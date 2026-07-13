@@ -1,0 +1,193 @@
+from __future__ import annotations
+
+import os
+import time
+import numpy as np
+import pandas as pd
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+# Optional: XGBoost
+try:
+    from xgboost import XGBRegressor
+    XGBOOST_AVAILABLE = True
+except Exception:
+    XGBOOST_AVAILABLE = False
+
+
+PROCESSED_PATH = "data/processed/ucihourly_features.csv"
+TARGET = "Global_active_power"
+
+# These match your Step 1 boundaries exactly
+TRAIN_END = "2009-09-20 19:00:00"
+VAL_END   = "2010-04-24 20:00:00"
+
+os.makedirs("outputs/tables", exist_ok=True)
+os.makedirs("outputs/figures", exist_ok=True)
+
+
+def mape(y_true, y_pred, eps=1e-8):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    denom = np.maximum(np.abs(y_true), eps)
+    return np.mean(np.abs((y_true - y_pred) / denom)) * 100.0
+
+
+def eval_metrics(y_true, y_pred):
+    return {
+        "MAE": mean_absolute_error(y_true, y_pred),
+        "RMSE": np.sqrt(mean_squared_error(y_true, y_pred)),
+        "MAPE": mape(y_true, y_pred),
+        "R2": r2_score(y_true, y_pred),
+    }
+
+
+def split_by_dates(df: pd.DataFrame):
+    train = df.loc[:TRAIN_END].copy()
+    val = df.loc[pd.to_datetime(TRAIN_END) + pd.Timedelta(hours=1):VAL_END].copy()
+    test = df.loc[pd.to_datetime(VAL_END) + pd.Timedelta(hours=1):].copy()
+    return train, val, test
+
+
+def make_xy(df: pd.DataFrame):
+    X = df.drop(columns=[TARGET])
+    y = df[TARGET].astype(float)
+    return X, y
+
+
+def plot_actual_vs_pred(test_index, y_true, y_pred, title, out_path):
+    import matplotlib.pyplot as plt
+
+    plt.figure()
+    plt.plot(test_index, y_true, label="Actual")
+    plt.plot(test_index, y_pred, label="Predicted")
+    plt.title(title)
+    plt.xlabel("Time")
+    plt.ylabel(TARGET)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+
+
+def main():
+    # Load processed feature dataset
+    df = pd.read_csv(PROCESSED_PATH, index_col=0, parse_dates=True)
+    df.index.name = "datetime"
+    df = df.sort_index()
+
+    # Ensure explicit hourly frequency (helps consistency)
+    # If this adds NaNs (should be minimal), fill them.
+    df = df.asfreq("1H")
+    if df.isna().any().any():
+        df = df.interpolate("time").ffill().bfill()
+
+    train, val, test = split_by_dates(df)
+
+    print("Train:", train.shape, train.index.min(), "to", train.index.max())
+    print("Val:  ", val.shape, val.index.min(), "to", val.index.max())
+    print("Test: ", test.shape, test.index.min(), "to", test.index.max())
+
+    X_train, y_train = make_xy(train)
+    X_val, y_val = make_xy(val)
+    X_test, y_test = make_xy(test)
+
+    results = []
+    preds_out = pd.DataFrame({"y_true": y_test}, index=test.index)
+
+    # ===== Random Forest =====
+    # Start with sensible defaults; tune lightly later if needed.
+    rf = RandomForestRegressor(
+        n_estimators=300,
+        max_depth=None,
+        min_samples_split=2,
+        min_samples_leaf=1,
+        random_state=42,
+        n_jobs=-1,
+    )
+
+    t0 = time.time()
+    rf.fit(X_train, y_train)
+    train_time = time.time() - t0
+
+    t1 = time.time()
+    rf_pred = rf.predict(X_test)
+    pred_time = time.time() - t1
+
+    rf_metrics = eval_metrics(y_test, rf_pred)
+    print("\nRF metrics (TEST):", rf_metrics)
+
+    results.append({
+        "Model": "RandomForest",
+        **rf_metrics,
+        "TrainTimeSec": train_time,
+        "PredictTimeSec": pred_time
+    })
+    preds_out["y_rf"] = rf_pred
+
+    plot_actual_vs_pred(
+        test.index, y_test.values, rf_pred,
+        "Random Forest: Actual vs Predicted (Test)",
+        "outputs/figures/test_plot_rf.png"
+    )
+
+    # ===== XGBoost =====
+    if XGBOOST_AVAILABLE:
+        # Note: objective for regression, tuned mildly; adjust later if needed.
+        xgb = XGBRegressor(
+            n_estimators=800,
+            learning_rate=0.05,
+            max_depth=6,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_lambda=1.0,
+            random_state=42,
+            n_jobs=-1,
+        )
+
+        # Fit on train, use val for early stopping (prevents overfit)
+        t0 = time.time()
+        xgb.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            verbose=False
+        )
+        train_time = time.time() - t0
+
+        t1 = time.time()
+        xgb_pred = xgb.predict(X_test)
+        pred_time = time.time() - t1
+
+        xgb_metrics = eval_metrics(y_test, xgb_pred)
+        print("\nXGBoost metrics (TEST):", xgb_metrics)
+
+        results.append({
+            "Model": "XGBoost",
+            **xgb_metrics,
+            "TrainTimeSec": train_time,
+            "PredictTimeSec": pred_time
+        })
+        preds_out["y_xgb"] = xgb_pred
+
+        plot_actual_vs_pred(
+            test.index, y_test.values, xgb_pred,
+            "XGBoost: Actual vs Predicted (Test)",
+            "outputs/figures/test_plot_xgb.png"
+        )
+    else:
+        print("\nXGBoost not available. Install with: pip install xgboost")
+
+    # Save metrics + predictions
+    res_df = pd.DataFrame(results)
+    res_df.to_csv("outputs/tables/ml_metrics.csv", index=False)
+    preds_out.to_csv("outputs/tables/ml_predictions.csv")
+
+    print("\nSaved:")
+    print(" - outputs/tables/ml_metrics.csv")
+    print(" - outputs/tables/ml_predictions.csv")
+    print(" - outputs/figures/test_plot_rf.png (+ xgb plot if available)")
+
+
+if __name__ == "__main__":
+    main()

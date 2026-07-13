@@ -1,0 +1,161 @@
+from __future__ import annotations
+
+import os
+import time
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")
+
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+try:
+    import shap
+except Exception as e:
+    raise ImportError("SHAP not installed. Run: python -m pip install shap") from e
+
+try:
+    from xgboost import XGBRegressor
+except Exception as e:
+    raise ImportError("XGBoost not installed. Run: python -m pip install xgboost") from e
+
+
+# ================= CONFIG =================
+PROCESSED_PATH = "data/processed/ucihourly_features.csv"
+TARGET = "Global_active_power"
+
+TRAIN_END = "2009-09-20 19:00:00"
+VAL_END   = "2010-04-24 20:00:00"
+
+RESAMPLE_FREQ = "1h"
+
+FIG_DIR = "outputs/figures"
+# =========================================
+
+
+def ensure_dirs():
+    os.makedirs(FIG_DIR, exist_ok=True)
+
+
+def split_by_dates(df):
+    train = df.loc[:TRAIN_END].copy()
+    val = df.loc[pd.to_datetime(TRAIN_END) + pd.Timedelta(hours=1):VAL_END].copy()
+    test = df.loc[pd.to_datetime(VAL_END) + pd.Timedelta(hours=1):].copy()
+    return train, val, test
+
+
+def make_xy(df):
+    X = df.drop(columns=[TARGET])
+    y = df[TARGET].astype(float)
+    return X, y
+
+
+def load_processed():
+    if not os.path.exists(PROCESSED_PATH):
+        raise FileNotFoundError("Run main_step1.py first to generate the processed dataset.")
+
+    df = pd.read_csv(PROCESSED_PATH, index_col=0, parse_dates=True)
+    df.index.name = "datetime"
+    df = df.sort_index()
+
+    df = df.asfreq(RESAMPLE_FREQ)
+    if df.isna().any().any():
+        df = df.interpolate("time").ffill().bfill()
+
+    return df
+
+
+def main():
+    ensure_dirs()
+
+    df = load_processed()
+    train, val, test = split_by_dates(df)
+
+    X_train, y_train = make_xy(train)
+    X_val, y_val = make_xy(val)
+    X_test, y_test = make_xy(test)
+
+    print("Train:", train.shape, train.index.min(), "to", train.index.max())
+    print("Val:  ", val.shape, val.index.min(), "to", val.index.max())
+    print("Test: ", test.shape, test.index.min(), "to", test.index.max())
+
+    # Train XGBoost (same style as Step 3)
+    model = XGBRegressor(
+        n_estimators=2000,
+        learning_rate=0.03,
+        max_depth=6,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_lambda=1.0,
+        random_state=42,
+        n_jobs=-1,
+    )
+
+    t0 = time.time()
+    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+    print("Model trained in", round(time.time() - t0, 2), "seconds")
+
+    # --- SHAP ---
+    # To keep it fast, explain a sample of the test set (e.g., 1000 rows)
+    sample_size = min(1000, len(X_test))
+    X_explain = X_test.sample(sample_size, random_state=42)
+
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X_explain)
+
+    # 1) Global feature importance (bar)
+    shap.summary_plot(shap_values, X_explain, plot_type="bar", show=False)
+    import matplotlib.pyplot as plt
+    plt.tight_layout()
+    out1 = os.path.join(FIG_DIR, "shap_global_bar.png")
+    plt.savefig(out1, dpi=200)
+    plt.close()
+    print("Saved:", out1)
+
+    # 2) Global summary beeswarm
+    shap.summary_plot(shap_values, X_explain, show=False)
+    plt.tight_layout()
+    out2 = os.path.join(FIG_DIR, "shap_summary_beeswarm.png")
+    plt.savefig(out2, dpi=200)
+    plt.close()
+    print("Saved:", out2)
+
+    # 3) Local explanation (waterfall) for one instance
+    # Pick one example from the explained sample
+    i = 0
+    x_row = X_explain.iloc[i]
+    # In newer SHAP versions, use shap.Explanation
+    try:
+        exp = shap.Explanation(
+            values=shap_values[i],
+            base_values=explainer.expected_value,
+            data=x_row.values,
+            feature_names=list(X_explain.columns)
+        )
+        shap.plots.waterfall(exp, show=False)
+        out3 = os.path.join(FIG_DIR, "shap_local_waterfall.png")
+        plt.tight_layout()
+        plt.savefig(out3, dpi=200)
+        plt.close()
+        print("Saved:", out3)
+    except Exception as e:
+        # Fallback: older API
+        try:
+            shap.waterfall_plot(
+                shap.Explanation(
+                    values=shap_values[i],
+                    base_values=explainer.expected_value,
+                    data=x_row.values,
+                    feature_names=list(X_explain.columns),
+                ),
+                show=False
+            )
+        except Exception:
+            print("Local SHAP waterfall plot failed:", e)
+
+    print("\nSHAP complete. Check outputs/figures for SHAP plots.")
+
+
+if __name__ == "__main__":
+    main()

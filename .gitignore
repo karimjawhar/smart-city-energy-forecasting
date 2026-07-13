@@ -1,0 +1,29 @@
+# Python virtual environment
+dl_env/
+venv/
+env/
+.venv/
+
+# Large data files
+data/raw/household_power_consumption.txt
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Streamlit
+.streamlit/secrets.toml

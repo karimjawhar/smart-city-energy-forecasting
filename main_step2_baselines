@@ -1,0 +1,130 @@
+from __future__ import annotations
+
+import os
+import time
+import numpy as np
+import pandas as pd
+
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+# ARIMA
+from statsmodels.tsa.arima.model import ARIMA
+
+
+PROCESSED_PATH = "data/processed/ucihourly_features.csv"
+TARGET = "Global_active_power"
+
+TRAIN_END = "2009-09-20 19:00:00"
+VAL_END   = "2010-04-24 20:00:00"
+
+os.makedirs("outputs/tables", exist_ok=True)
+os.makedirs("outputs/figures", exist_ok=True)
+
+
+def mape(y_true, y_pred, eps=1e-8):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    denom = np.maximum(np.abs(y_true), eps)
+    return np.mean(np.abs((y_true - y_pred) / denom)) * 100.0
+
+
+def eval_metrics(y_true, y_pred):
+    return {
+        "MAE": mean_absolute_error(y_true, y_pred),
+        "RMSE": np.sqrt(mean_squared_error(y_true, y_pred)),
+        "MAPE": mape(y_true, y_pred),
+        "R2": r2_score(y_true, y_pred),
+    }
+
+
+def split_by_dates(df: pd.DataFrame):
+    train = df.loc[:TRAIN_END].copy()
+    val = df.loc[pd.to_datetime(TRAIN_END) + pd.Timedelta(hours=1):VAL_END].copy()
+    test = df.loc[pd.to_datetime(VAL_END) + pd.Timedelta(hours=1):].copy()
+    return train, val, test
+
+
+def naive_forecast(series: pd.Series) -> pd.Series:
+    # y_hat(t) = y(t-1)
+    return series.shift(1)
+
+
+def fit_arima_and_forecast(train_y: pd.Series, horizon_index: pd.DatetimeIndex, order=(2,0,2)) -> pd.Series:
+    model = ARIMA(train_y, order=order)
+    fitted = model.fit()
+    fc = fitted.forecast(steps=len(horizon_index))
+    fc.index = horizon_index
+    return fc
+
+
+def main():
+    df = pd.read_csv(PROCESSED_PATH, parse_dates=["datetime"], index_col="datetime")
+    # (your csv may have index name different; if error, tell me and I’ll adjust)
+
+    print("Loaded processed dataset:", df.shape, df.index.min(), "to", df.index.max())
+
+    train, val, test = split_by_dates(df)
+
+    print("\nSplit sizes:")
+    print("Train:", train.shape, train.index.min(), "to", train.index.max())
+    print("Val:  ", val.shape, val.index.min(), "to", val.index.max())
+    print("Test: ", test.shape, test.index.min(), "to", test.index.max())
+
+    results = []
+
+    # ===== Naive baseline =====
+    t0 = time.time()
+    naive_pred = naive_forecast(df[TARGET])
+    # Evaluate only on test (make sure alignment)
+    naive_test_pred = naive_pred.loc[test.index]
+    naive_test_true = test[TARGET]
+    naive_metrics = eval_metrics(naive_test_true, naive_test_pred)
+    results.append({"Model": "Naive(t-1)", **naive_metrics, "TrainTimeSec": 0.0, "PredictTimeSec": time.time() - t0})
+    print("\nNaive baseline metrics (TEST):", naive_metrics)
+
+    # ===== ARIMA baseline =====
+    # Tune order lightly using VAL (simple grid keeps it UG-feasible)
+    candidate_orders = [(1,0,1), (2,0,2), (3,0,3), (2,0,1), (1,0,2)]
+    best_order = None
+    best_rmse = float("inf")
+
+    for order in candidate_orders:
+        try:
+            # Fit on train only, forecast over val horizon
+            val_pred = fit_arima_and_forecast(train[TARGET], val.index, order=order)
+            met = eval_metrics(val[TARGET], val_pred)
+            if met["RMSE"] < best_rmse:
+                best_rmse = met["RMSE"]
+                best_order = order
+        except Exception as e:
+            continue
+
+    print("\nBest ARIMA order from VAL:", best_order, "VAL RMSE:", best_rmse)
+
+    # Refit ARIMA on train+val, test on held-out test
+    t0 = time.time()
+    trainval_y = pd.concat([train[TARGET], val[TARGET]])
+    arima_pred = fit_arima_and_forecast(trainval_y, test.index, order=best_order)
+    train_time = time.time() - t0
+
+    arima_metrics = eval_metrics(test[TARGET], arima_pred)
+    results.append({"Model": f"ARIMA{best_order}", **arima_metrics, "TrainTimeSec": train_time, "PredictTimeSec": 0.0})
+    print("\nARIMA metrics (TEST):", arima_metrics)
+
+    # Save results table
+    res_df = pd.DataFrame(results)
+    res_df.to_csv("outputs/tables/baseline_metrics.csv", index=False)
+    print("\nSaved: outputs/tables/baseline_metrics.csv")
+
+    # Save prediction CSVs (useful for plots + appendix)
+    out_pred = pd.DataFrame({
+        "y_true": test[TARGET],
+        "y_naive": naive_test_pred,
+        "y_arima": arima_pred
+    }, index=test.index)
+    out_pred.to_csv("outputs/tables/baseline_predictions.csv")
+    print("Saved: outputs/tables/baseline_predictions.csv")
+
+
+if __name__ == "__main__":
+    main()

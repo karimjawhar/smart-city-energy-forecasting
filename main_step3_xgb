@@ -1,0 +1,174 @@
+from __future__ import annotations
+
+import os
+import time
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")
+
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+try:
+    from xgboost import XGBRegressor
+except Exception as e:
+    raise ImportError("XGBoost not installed. Run: python -m pip install xgboost") from e
+
+
+# ================= CONFIG =================
+PROCESSED_PATH = "data/processed/ucihourly_features.csv"
+TARGET = "Global_active_power"
+
+TRAIN_END = "2009-09-20 19:00:00"
+VAL_END   = "2010-04-24 20:00:00"
+
+RESAMPLE_FREQ = "1h"
+
+TABLES_DIR = "outputs/tables"
+FIG_DIR = "outputs/figures"
+# =========================================
+
+
+def ensure_dirs():
+    os.makedirs(TABLES_DIR, exist_ok=True)
+    os.makedirs(FIG_DIR, exist_ok=True)
+
+
+def mape(y_true, y_pred, eps=1e-8):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    denom = np.maximum(np.abs(y_true), eps)
+    return float(np.mean(np.abs((y_true - y_pred) / denom)) * 100.0)
+
+
+def eval_metrics(y_true, y_pred):
+    return {
+        "MAE": float(mean_absolute_error(y_true, y_pred)),
+        "RMSE": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "MAPE": mape(y_true, y_pred),
+        "R2": float(r2_score(y_true, y_pred)),
+    }
+
+
+def split_by_dates(df):
+    train = df.loc[:TRAIN_END].copy()
+    val = df.loc[pd.to_datetime(TRAIN_END) + pd.Timedelta(hours=1):VAL_END].copy()
+    test = df.loc[pd.to_datetime(VAL_END) + pd.Timedelta(hours=1):].copy()
+    return train, val, test
+
+
+def make_xy(df):
+    X = df.drop(columns=[TARGET])
+    y = df[TARGET].astype(float)
+    return X, y
+
+
+def plot_actual_vs_pred(test_index, y_true, y_pred, title, out_path):
+    import matplotlib.pyplot as plt
+    plt.figure()
+    plt.plot(test_index, y_true, label="Actual")
+    plt.plot(test_index, y_pred, label="Predicted")
+    plt.title(title)
+    plt.xlabel("Time")
+    plt.ylabel(TARGET)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+
+
+def load_processed():
+    if not os.path.exists(PROCESSED_PATH):
+        raise FileNotFoundError("Run main_step1.py first to generate the processed dataset.")
+    df = pd.read_csv(PROCESSED_PATH, index_col=0, parse_dates=True)
+    df.index.name = "datetime"
+    df = df.sort_index()
+    df = df.asfreq(RESAMPLE_FREQ)
+    if df.isna().any().any():
+        df = df.interpolate("time").ffill().bfill()
+    return df
+
+
+def safe_save_csv(df, base_name):
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(TABLES_DIR, f"{base_name}_{ts}.csv")
+    df.to_csv(path, index=False)
+    return path
+
+
+def safe_save_csv_indexed(df, base_name):
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(TABLES_DIR, f"{base_name}_{ts}.csv")
+    df.to_csv(path)
+    return path
+
+
+def main():
+    ensure_dirs()
+    df = load_processed()
+
+    train, val, test = split_by_dates(df)
+
+    X_train, y_train = make_xy(train)
+    X_val, y_val = make_xy(val)
+    X_test, y_test = make_xy(test)
+
+    print("Train:", train.shape, train.index.min(), "to", train.index.max())
+    print("Val:  ", val.shape, val.index.min(), "to", val.index.max())
+    print("Test: ", test.shape, test.index.min(), "to", test.index.max())
+
+    # XGBoost: good starting config for tabular time-series features
+    xgb = XGBRegressor(
+        n_estimators=2000,
+        learning_rate=0.03,
+        max_depth=6,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_lambda=1.0,
+        random_state=42,
+        n_jobs=-1,
+    )
+
+    t0 = time.time()
+    xgb.fit(
+        X_train, y_train,
+        eval_set=[(X_val, y_val)],
+        verbose=False
+    )
+    train_time = time.time() - t0
+
+    t1 = time.time()
+    y_pred = xgb.predict(X_test)
+    pred_time = time.time() - t1
+
+    metrics = eval_metrics(y_test, y_pred)
+    print("\nXGBoost metrics:", metrics)
+
+    # Save metrics + preds
+    res_df = pd.DataFrame([{
+        "Model": "XGBoost",
+        **metrics,
+        "TrainTimeSec": train_time,
+        "PredictTimeSec": pred_time
+    }])
+
+    preds_df = pd.DataFrame({"y_true": y_test, "y_xgb": y_pred}, index=test.index)
+
+    metrics_path = safe_save_csv(res_df, "xgb_metrics")
+    preds_path = safe_save_csv_indexed(preds_df, "xgb_predictions")
+
+    plot_actual_vs_pred(
+        test.index, y_test.values, y_pred,
+        "XGBoost: Actual vs Predicted (Test)",
+        os.path.join(FIG_DIR, "test_plot_xgb.png")
+    )
+
+    print("\nSaved:")
+    print(" -", metrics_path)
+    print(" -", preds_path)
+    print(" -", os.path.join(FIG_DIR, "test_plot_xgb.png"))
+
+
+if __name__ == "__main__":
+    main()
